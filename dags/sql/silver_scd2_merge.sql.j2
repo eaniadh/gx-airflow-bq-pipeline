@@ -1,0 +1,62 @@
+-- SCD-2 MERGE (hash-diff) from BRONZE to SILVER
+
+-- 0) variable declaration
+DECLARE process_date DATE DEFAULT DATE("{{ process_date }}");
+
+-- 1) DDL
+CREATE SCHEMA IF NOT EXISTS `{{ project_id }}.{{ dataset_silver }}`;
+
+CREATE TABLE IF NOT EXISTS `{{ project_id }}.{{ dataset_silver }}.{{ silver_table }}` (
+  customer_id STRING,
+  name        STRING,
+  email       STRING,
+  region      STRING,
+  eff_from    DATE,
+  eff_to      DATE,
+  is_current  BOOL,
+  hash_diff   STRING
+);
+
+-- 2) Snapshot source for the day
+CREATE TEMP TABLE src AS
+SELECT
+  CAST(customer_id AS STRING) AS customer_id,
+  CAST(NULL AS STRING) AS name,           -- not present in orders_ext
+  CAST(NULL AS STRING) AS email,          -- not present in orders_ext
+  ANY_VALUE(region)    AS region,
+  TO_HEX(
+    SHA256(
+      TO_JSON_STRING(STRUCT(
+        -- hash only the attributes which actually exists
+        ANY_VALUE(region) AS region
+      ))
+    )
+  ) AS hash_diff
+FROM `{{ project_id }}.{{ dataset_bronze }}.{{ bronze_table }}`
+WHERE REGEXP_EXTRACT(_FILE_NAME, r'date=([0-9-]+)') = FORMAT_DATE('%Y-%m-%d', process_date)
+GROUP BY customer_id;
+
+
+-- 3) Close out changed rows
+UPDATE `{{ project_id }}.{{ dataset_silver }}.{{ silver_table }}` AS t
+SET t.eff_to = DATE_SUB(process_date, INTERVAL 1 DAY),
+    t.is_current = FALSE
+WHERE t.is_current = TRUE
+  AND EXISTS (
+    SELECT 1
+    FROM src s
+    WHERE s.customer_id = t.customer_id
+      AND s.hash_diff != t.hash_diff
+  );
+
+-- 4) Insert new/changed as current
+INSERT INTO `{{ project_id }}.{{ dataset_silver }}.{{ silver_table }}`
+(customer_id, name, email, region, eff_from, eff_to, is_current, hash_diff)
+SELECT
+  s.customer_id, s.name, s.email, s.region,
+  process_date, DATE "9999-12-31", TRUE, s.hash_diff
+FROM src s
+LEFT JOIN `{{ project_id }}.{{ dataset_silver }}.{{ silver_table }}` t
+  ON t.customer_id = s.customer_id AND t.is_current = TRUE
+WHERE t.customer_id IS NULL
+   OR t.hash_diff != s.hash_diff;

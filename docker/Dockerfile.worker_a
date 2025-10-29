@@ -1,0 +1,8 @@
+ARG AIRFLOW_IMAGE=apache/airflow:2.8.4-python3.10
+FROM ${AIRFLOW_IMAGE}
+
+USER airflow
+# shared deps used by scheduler/webserver at DAG-parse time should be in base image,
+# but worker-specific deps can live here:
+COPY docker/requirements.worker_a.txt /requirements.txt
+RUN pip install --no-cache-dir -r /requirements.txt

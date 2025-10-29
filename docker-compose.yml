@@ -1,0 +1,218 @@
+# -------------------------------------------------------------------
+# Common Airflow settings
+# -------------------------------------------------------------------
+x-celery: &celery-env
+  AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+  AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres:5432/airflow
+  # Optional tuning
+  AIRFLOW__CELERY__WORKER_CONCURRENCY: 8
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.4-python3.11} # <--- change if you build a custom "base" image
+  # <--- change if you build a custom "base" image
+  env_file: ./keys/.env
+  environment:
+    HOME: /home/airflow
+    PATH: "/home/airflow/.local/bin:${PATH}"
+    AIRFLOW__CORE__EXECUTOR: ${EXECUTOR} # should be CeleryExecutor in .env
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__BASE_LOG_FOLDER: /opt/airflow/logs
+    AIRFLOW__LOGGING__DAG_PROCESSOR_MANAGER_LOG_LOCATION: /opt/airflow/logs/dag_processor_manager/dag_processor_manager.log
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS}
+    AIRFLOW__CORE__XCOM_BACKEND: ${XCOM_BACKEND}
+    AIRFLOW__OPERATORS__DEFAULT_QUEUE: gx_bq_pipeline
+    AIRFLOW__CELERY__DEFAULT_QUEUE: gx_bq_pipeline
+    AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+    <<: *celery-env
+  volumes:
+  - ./dags:/opt/airflow/dags
+  - ./dags/sql:/opt/airflow/dags/sql
+  - ./logs:/opt/airflow/logs
+  - ./plugins:/opt/airflow/plugins
+  - ./keys:/opt/airflow/keys:ro
+  - ./gx_bq_pipeline/configs:/opt/airflow/configs
+  - ./gx_bq_pipeline/scripts:/opt/airflow/scripts
+  - ./gx_bq_pipeline/gx:/opt/airflow/gx
+  - ./gx_bq_pipeline/configs:/opt/airflow/configs:ro
+  user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+
+# -------------------------------------------------------------------
+# Services
+# -------------------------------------------------------------------
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+    - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U airflow -d airflow" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Celery broker
+  redis:
+    image: redis:7
+    restart: unless-stopped
+
+  # Initialize DB + create admin user
+  airflow-init:
+    image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.4-python3.11}
+    depends_on:
+    - postgres
+    - redis
+    environment:
+      HOME: /home/airflow
+      PATH: "/home/airflow/.local/bin:${PATH}"
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+      <<: *celery-env
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+    entrypoint: [ "/bin/bash", "-lc" ]
+    command: >
+      set -e mkdir -p /opt/airflow/{dags,logs,plugins} /home/airflow/.local/bin/airflow db migrate /home/airflow/.local/bin/airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
+    volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    environment:
+      HOME: /home/airflow
+      PATH: "/home/airflow/.local/bin:${PATH}"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      # Remote logging to GCS (keep your existing settings)
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "true"
+      AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: "gs://airflow-logs-alert-study-468915-n0-us-central1/airflow-logs"
+      AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: "google_cloud_default"
+      AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+
+    ports:
+    - "8080:8080"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    environment:
+      HOME: /home/airflow
+      PATH: "/home/airflow/.local/bin:${PATH}"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "true"
+      AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: "gs://airflow-logs-alert-study-468915-n0-us-central1/airflow-logs"
+      AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: "google_cloud_default"
+      AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    environment:
+      HOME: /home/airflow
+      PATH: "/home/airflow/.local/bin:${PATH}"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+
+  # -------------------- Workers with isolated queues --------------------
+
+  # # Worker A (queue: pipeline_a) — build if you need extra deps for pipeline A
+  # worker-a:
+  #   <<: *airflow-common
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.worker_a # <--- create this file if you need custom deps
+  #     args:
+  #       AIRFLOW_IMAGE: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.4}
+  #   image: airflow-worker-a:latest
+  #   command: celery worker --queues pipeline_a
+  #   environment:
+  #     <<: *celery-env
+  #     AIRFLOW__CELERY__DEFAULT_QUEUE: pipeline_a
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_started
+
+  worker-gx-bq-pipeline:
+    <<: *airflow-common
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gx_bq_pipeline
+      args:
+        AIRFLOW_IMAGE: apache/airflow:2.8.4-python3.11
+    image: airflow-worker-gx-bq-pipeline:latest
+    command: airflow celery worker --queues gx_bq_pipeline
+    environment:
+      <<: *celery-env
+      AIRFLOW__CELERY__DEFAULT_QUEUE: gx_bq_pipeline
+      GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/keys/service-account.json
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      CONSUMER_API_URL: ${CONSUMER_API_URL:-}
+      AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+    volumes:
+    - ./dags:/opt/airflow/dags
+    - ./gx_bq_pipeline/configs:/opt/airflow/configs
+    - ./gx_bq_pipeline/scripts:/opt/airflow/scripts
+    - ./gx_bq_pipeline/gx:/opt/airflow/gx
+    - ./keys:/opt/airflow/keys
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  #Optional: Celery Flower for monitoring
+  airflow-flower:
+    <<: *airflow-common
+    command: celery flower
+    ports: [ "5555:5555" ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  postgres-db-volume:

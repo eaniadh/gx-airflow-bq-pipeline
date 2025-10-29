@@ -1,0 +1,52 @@
+# ─────────────────────────────
+# Python / Airflow / GX Project
+# ─────────────────────────────
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv*/
+venv*/
+.env
+
+# Airflow
+airflow.db
+airflow-webserver.pid
+logs/
+*/logs/*
+unittests.cfg
+scheduler/
+webserver_config.py
+airflow.cfg
+airflow_local_settings.py
+
+# GX
+gx_bq_pipeline/gx/uncommitted/
+gx_bq_pipeline/gx/checkpoints/
+gx_bq_pipeline/gx/plugins/__pycache__/
+gx_bq_pipeline/gx/plugins/*/__pycache__/
+gx_bq_pipeline/gx/uncommitted/data_docs/
+gx_bq_pipeline/gx/uncommitted/validations/
+
+# Docker
+*.pid
+*.sock
+*.tar
+docker-compose.override.yml
+
+# Secrets / Keys
+keys/
+*.json
+*.pem
+*.key
+*.p12
+*.crt
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+Thumbs.db

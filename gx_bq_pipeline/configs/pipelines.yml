@@ -1,0 +1,22 @@
+orders:
+  project_id: alert-study-468915-n0
+  bq_table: alert-study-468915-n0.demo_gx.orders_ext
+  queue: gx_bq_pipeline
+  landing_bucket: gx_data_landing
+  ready_bucket: gx_data_ready_to_process
+  error_bucket: gx_data_error
+  buckets: [ gx_data_landing, gx_data_ready_to_process, gx_data_error ]
+  suite_basic: orders_basic_suite
+  suite_cross: orders_cross_suite
+  mode: basic
+  retries: 2
+  schedule: "0 5 * * *" # Daily 5 AM UTC (~10:30 AM IST)
+  alert_email: "data-alerts@example.com"
+  # ✅ Freshness + “today only”
+  timezone: "UTC" # e.g., "America/Los_Angeles"
+  enforce_today_only: true # only run if ds == "today" in this timezone
+  landing_min_files: 1 # min data files to consider input “ready”
+  landing_required_suffix: .parquet
+  landing_accept_success: true # treat _SUCCESS in landing as ready (if you ever write it)
+  max_input_age_minutes: 600 # newest LZ file must be younger than this
+  max_publish_age_minutes: 600 # _MANIFEST.json/_SUCCESS in READY must be younger than this

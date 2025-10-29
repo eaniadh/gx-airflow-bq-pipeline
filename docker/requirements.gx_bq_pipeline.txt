@@ -1,0 +1,15 @@
+apache-airflow-providers-google
+
+google-cloud-bigquery>=3.11.4
+google-cloud-storage>=2.14.0
+google-cloud-bigquery-storage
+
+great_expectations==0.17.23
+
+fsspec[gcs]
+# gcsfs  (optional; only if you actually need it)
+pandas
+python-dotenv
+PyYAML
+faker
+
