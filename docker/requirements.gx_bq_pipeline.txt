@@ -1,15 +1,19 @@
-apache-airflow-providers-google
-
-google-cloud-bigquery>=3.11.4
-google-cloud-storage>=2.14.0
-google-cloud-bigquery-storage
+# docker/requirements.gx_bq_pipeline.txt
+# Airflow providers
+#apache-airflow-providers-google
+openlineage-airflow>=1.9.0
+openlineage-airflow[bigquery]
+openlineage-python>=1.0.0
+#openlineage-great-expectations>=0.5.0
 
 great_expectations==0.17.23
 
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-bigquery-storage
+
 fsspec[gcs]
-# gcsfs  (optional; only if you actually need it)
 pandas
 python-dotenv
 PyYAML
 faker
-

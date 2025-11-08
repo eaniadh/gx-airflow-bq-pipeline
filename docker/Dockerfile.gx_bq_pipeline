@@ -1,6 +1,9 @@
-ARG AIRFLOW_IMAGE=apache/airflow:2.8.4-python3.11
+ARG AIRFLOW_IMAGE=airflow-with-ol:2.8.4-py311
 FROM ${AIRFLOW_IMAGE}
 
 USER airflow
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
 COPY docker/requirements.gx_bq_pipeline.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.4/constraints-3.11.txt"
+
+RUN pip install --no-cache-dir -r /tmp/requirements.txt

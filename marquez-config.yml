@@ -1,0 +1,29 @@
+server:
+  type: simple
+  applicationContextPath: /
+  adminContextPath: /admin
+  connector:
+    type: http
+    port: 5000
+
+logging:
+  level: INFO
+
+# NOTE: key is "db", not "database"
+db:
+  driverClass: org.postgresql.Driver
+  url: jdbc:postgresql://postgres:5432/marquez
+  user: airflow
+  password: airflow
+  properties:
+    charSet: UTF-8
+  maxSize: 20
+  minSize: 2
+  # Durations must be strings:
+  checkConnectionWhileIdle: true
+  validationQuery: "SELECT 1"
+  evictionInterval: "5s"
+  minIdleTime: "30s"
+  validationInterval: "30s"
+
+migrateOnStartup: true

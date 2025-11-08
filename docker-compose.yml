@@ -7,9 +7,13 @@ x-celery: &celery-env
   # Optional tuning
   AIRFLOW__CELERY__WORKER_CONCURRENCY: 8
 
-x-airflow-common: &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.4-python3.11} # <--- change if you build a custom "base" image
-  # <--- change if you build a custom "base" image
+x-airflow-common:
+  #image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.4-python3.11} # <--- change if you build a custom "base" image
+  &airflow-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.airflow_base
+  image: airflow-with-ol:2.8.4-py311
   env_file: ./keys/.env
   environment:
     HOME: /home/airflow
@@ -28,10 +32,18 @@ x-airflow-common: &airflow-common
     AIRFLOW__OPERATORS__DEFAULT_QUEUE: gx_bq_pipeline
     AIRFLOW__CELERY__DEFAULT_QUEUE: gx_bq_pipeline
     AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+    AIRFLOW__LINEAGE__BACKEND: openlineage.lineage_backend.OpenLineageBackend
+    OPENLINEAGE_URL: http://marquez:5000
+    OPENLINEAGE_NAMESPACE: gx-bq-pipeline
+    OPENLINEAGE_EXTRACTOR_PREFER_SQL_PARSER: "true"
+    # BigQuery extractor is on
+    OPENLINEAGE_EXTRACTOR_BigQueryExtractor_ENABLED: "true"
+    OPENLINEAGE_EXTRACTOR_BIGQUERY_ENABLED: "true"
     <<: *celery-env
   volumes:
   - ./dags:/opt/airflow/dags
   - ./dags/sql:/opt/airflow/dags/sql
+  - ./dags/helpers:/opt/airflow/dags/helpers
   - ./logs:/opt/airflow/logs
   - ./plugins:/opt/airflow/plugins
   - ./keys:/opt/airflow/keys:ro
@@ -100,7 +112,12 @@ services:
       AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: "gs://airflow-logs-alert-study-468915-n0-us-central1/airflow-logs"
       AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: "google_cloud_default"
       AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
-
+      AIRFLOW__LINEAGE__BACKEND: openlineage.lineage_backend.OpenLineageBackend
+      OPENLINEAGE_URL: http://marquez:5000 # or http://marquez:5000/api/v1/lineage
+      OPENLINEAGE_NAMESPACE: gx-bq-pipeline
+      OPENLINEAGE_EXTRACTOR_PREFER_SQL_PARSER: "true"
+      OPENLINEAGE_EXTRACTOR_BigQueryExtractor_ENABLED: "true"
+      OPENLINEAGE_EXTRACTOR_BIGQUERY_ENABLED: "true"
     ports:
     - "8080:8080"
     healthcheck:
@@ -127,6 +144,12 @@ services:
       AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: "gs://airflow-logs-alert-study-468915-n0-us-central1/airflow-logs"
       AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: "google_cloud_default"
       AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+      AIRFLOW__LINEAGE__BACKEND: openlineage.lineage_backend.OpenLineageBackend
+      OPENLINEAGE_URL: http://marquez:5000 # or http://marquez:5000/api/v1/lineage
+      OPENLINEAGE_NAMESPACE: gx-bq-pipeline
+      OPENLINEAGE_EXTRACTOR_PREFER_SQL_PARSER: "true"
+      OPENLINEAGE_EXTRACTOR_BigQueryExtractor_ENABLED: "true"
+      OPENLINEAGE_EXTRACTOR_BIGQUERY_ENABLED: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -179,7 +202,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.gx_bq_pipeline
       args:
-        AIRFLOW_IMAGE: apache/airflow:2.8.4-python3.11
+        AIRFLOW_IMAGE: airflow-with-ol:2.8.4-py311
     image: airflow-worker-gx-bq-pipeline:latest
     command: airflow celery worker --queues gx_bq_pipeline
     environment:
@@ -189,6 +212,12 @@ services:
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       CONSUMER_API_URL: ${CONSUMER_API_URL:-}
       AIRFLOW_CONN_GOOGLE_CLOUD_DEFAULT: google-cloud-platform:///?extra__google_cloud_platform__key_path=/opt/airflow/keys/service-account.json&extra__google_cloud_platform__scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&extra__google_cloud_platform__project=alert-study-468915-n0
+      AIRFLOW__LINEAGE__BACKEND: openlineage.lineage_backend.OpenLineageBackend
+      OPENLINEAGE_URL: http://marquez:5000
+      OPENLINEAGE_NAMESPACE: gx-bq-pipeline
+      OPENLINEAGE_EXTRACTOR_PREFER_SQL_PARSER: "true"
+      OPENLINEAGE_EXTRACTOR_BigQueryExtractor_ENABLED: "true"
+      OPENLINEAGE_EXTRACTOR_BIGQUERY_ENABLED: "true"
     volumes:
     - ./dags:/opt/airflow/dags
     - ./gx_bq_pipeline/configs:/opt/airflow/configs
@@ -213,6 +242,39 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+
+  marquez:
+    image: marquezproject/marquez:0.33.0
+    container_name: marquez
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MARQUEZ_CONFIG: /opt/marquez/config.yml
+      MARQUEZ_DISABLE_TELEMETRY: "true"
+    volumes:
+    - ./marquez-config.yml:/opt/marquez/config.yml:ro
+    ports:
+    - "5000:5000"
+    restart: unless-stopped
+
+  marquez-web:
+    image: marquezproject/marquez-web:0.33.0
+    container_name: marquez-web
+    depends_on:
+    - marquez
+    environment:
+      MARQUEZ_HOST: marquez
+      MARQUEZ_PORT: 5000
+      WEB_PORT: 3000
+      MARQUEZ_URL: http://marquez:5000
+      MARQUEZ_BASE_URL: http://marquez:5000
+      REACT_APP_MARQUEZ_URL: http://marquez:5000
+      API_URL: http://marquez:5000
+      REACT_APP_MARQUEZ_BASE_URL: "http://10.128.0.3:5000"
+    ports:
+    - "3000:3000"
+    restart: unless-stopped
 
 volumes:
   postgres-db-volume:

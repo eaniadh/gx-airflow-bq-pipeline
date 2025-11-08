@@ -5,12 +5,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 import json
 from dotenv import load_dotenv
+import uuid as _uuid
+from typing import ClassVar, List, Dict, Any, Optional
+from collections import defaultdict
+#from dataclasses import dataclass
+import attr
 import great_expectations as gx
 from great_expectations.core.expectation_suite import ExpectationSuite
 from great_expectations.exceptions import DataContextError
 from google.cloud import bigquery
 from google.cloud import storage
 from google.oauth2 import service_account
+
+# ---- OpenLineage v1 API (optional) ----
+try:
+    from openlineage.client import OpenLineageClient
+    from openlineage.client.run import RunEvent, RunState, Run, Job, Dataset
+    from openlineage.client.facet import BaseFacet
+    #from openlineage.client.run import InputDataset, OutputDataset
+    from openlineage.client.facet import SchemaDatasetFacet, SchemaField
+    _OL = True
+except Exception:
+    _OL = False
+
+
 
 # ---------------- CLI ----------------
 ap = argparse.ArgumentParser(
@@ -77,6 +95,27 @@ class _FakeBlob:
     @property
     def size(self):
         return self._size
+
+
+@attr.define
+class GxSummaryFacet(BaseFacet):
+    # Class-level metadata for OL facet
+    _producer: ClassVar[str]  = "app://gx_validate"
+    _schemaURL: ClassVar[str] = "https://openlineage.io/spec/facets/1-0-0/gx_summary"
+
+    suite: str
+    run_mode: str
+    success: bool
+    total: int
+    passed: int
+    failed: int
+    slice_row_count: int
+    bad_row_count: int
+    published: bool
+    partial_publish: bool
+    failed_expectations: Optional[List[Dict[str, Any]]] = None
+    passed_expectations: Optional[List[Dict[str, Any]]] = None
+    counts_by_expectation_type: Optional[Dict[str, Dict[str, int]]] = None
 
 # ---------------- Clients ----------------
 def make_storage_client(project: str) -> storage.Client:
@@ -272,22 +311,93 @@ WHERE REGEXP_EXTRACT(_FILE_NAME, r'date=([0-9-]+)') = '{RUN_DT}'
 """
 row_count = list(bq.query(row_count_sql).result())[0]["c"]
 
-# Failure summary for payload
+def _extract_columns_from_cfg(cfg) -> tuple[str | None, list | None]:
+    """Return (column, columns) from an expectation_config."""
+    if not cfg:
+        return None, None
+    kw = getattr(cfg, "kwargs", {}) or {}
+
+    # 1) single-column
+    if "column" in kw and kw["column"]:
+        return kw["column"], [kw["column"]]
+
+    # 2) column pair style
+    pair_keys = [k for k in ("column_A", "column_B", "column_a", "column_b") if k in kw and kw[k]]
+    if pair_keys:
+        cols = [kw[k] for k in pair_keys]
+        return None if len(cols) != 1 else cols[0], cols
+
+    # 3) multi-column list
+    if "column_list" in kw and kw["column_list"]:
+        cols = list(kw["column_list"])
+        return None if len(cols) != 1 else cols[0], cols
+
+    # 4) table-level (no columns)
+    return None, None
+
+
 def _summarize_failures(res):
     acc = []
     for r in res.results:
         if getattr(r, "success", False):
             continue
         cfg = getattr(r, "expectation_config", None)
-        etype = None
-        col = None
-        if cfg is not None:
-            etype = getattr(cfg, "expectation_type", None) or getattr(cfg, "type", None)
-            col = (getattr(cfg, "kwargs", {}) or {}).get("column")
-        acc.append({"expectation_type": etype, "column": col})
+        etype = getattr(cfg, "expectation_type", None) or getattr(cfg, "type", None)
+        column, columns = _extract_columns_from_cfg(cfg)
+        acc.append({
+            "expectation_type": etype,
+            "columns": columns,    # list for pair/multi/table(None)
+        })
     return acc
 
+
+def _summarize_passes(res):
+    acc = []
+    for r in res.results:
+        if not getattr(r, "success", False):
+            continue
+        cfg = getattr(r, "expectation_config", None)
+        etype = getattr(cfg, "expectation_type", None) or getattr(cfg, "type", None)
+        column, columns = _extract_columns_from_cfg(cfg)
+        acc.append({
+            "expectation_type": etype,
+            "columns": columns,
+        })
+    return acc
+
+# Counts by expectation type (passed vs failed)
+def _counts_by_type(res):
+    counts = defaultdict(lambda: {"passed": 0, "failed": 0})
+    for r in res.results:
+        cfg = getattr(r, "expectation_config", None)
+        etype = getattr(cfg, "expectation_type", None) or getattr(cfg, "type", None) or "unknown"
+        if getattr(r, "success", False):
+            counts[etype]["passed"] += 1
+        else:
+            counts[etype]["failed"] += 1
+    return dict(counts)
+
+def _bq_schema_fields(bq_client, table_fqn: str):
+    # table_fqn: "project.dataset.table"
+    tbl = bq_client.get_table(table_fqn)
+    out = []
+    def walk(fields, prefix=""):
+        for f in fields:
+            name = prefix + f.name
+            out.append(SchemaField(name=name, type=f.field_type, description=f.description or None))
+            if f.field_type.upper() == "record" and f.fields:   # case-insensitive
+                walk(f.fields, prefix=name + ".")
+    walk(tbl.schema)
+    return out
+
 failed_details = _summarize_failures(results)
+passed_details = _summarize_passes(results)
+counts_map     = _counts_by_type(results)
+
+# Avoid oversized facets (Marquez renders JSON; keep it reasonable)
+MAX_ITEMS = 100
+facet_failed_details = failed_details[:MAX_ITEMS]
+facet_passed_details = passed_details[:MAX_ITEMS]
 
 # Record result in BQ
 payload = {
@@ -428,6 +538,94 @@ else:
         "staged_file_count": len(staged_parquet),
     }
     gcs_write_text(READY_BUCKET, f"{staging_prefix}_FAILED", json.dumps(failed_meta))
+
+
+# ---------------- OpenLineage: emit start + summary facet ----------------
+
+# Ensure OL env defaults exist
+os.environ.setdefault("OPENLINEAGE_URL", "http://marquez:5000")
+os.environ.setdefault("OPENLINEAGE_NAMESPACE", "gx-bq-pipeline")
+
+if _OL:
+    try:
+        client = OpenLineageClient(os.getenv("OPENLINEAGE_URL", "http://marquez:5000"))
+        namespace = os.getenv("OPENLINEAGE_NAMESPACE", "gx-bq-pipeline")
+
+        published = bool(should_publish)
+        partial_publish = (not success) and published
+
+        job_name = os.getenv("AIRFLOW_JOB_NAME") or "gx_validate"
+        run_id = str(_uuid.uuid4())
+
+        # Inputs/Outputs
+        inputs = [Dataset(namespace="bigquery", name=f"{PROJECT}.{DATASET}.{TABLE}")]
+        # Prefer Dataset name without scheme when namespace conveys storage system
+        outputs = [Dataset(namespace="gcs", name=f"{READY_BUCKET}/date={RUN_DT}/")]
+
+        producer = "app://gx_validate"
+        bronze_fqn = f"{PROJECT}.{DATASET}.{TABLE}"
+        ready_name = f"{READY_BUCKET}/date={RUN_DT}/"
+        
+        # Build Bronze dataset WITH schema facet
+        try:
+            bronze_fields = _bq_schema_fields(bq, bronze_fqn)
+            bronze_ds = Dataset(
+                namespace="bigquery",
+                name=bronze_fqn,
+                facets={"schema": SchemaDatasetFacet(fields=bronze_fields)},
+            )
+        except Exception as e:
+            print(f"[OL] Could not fetch Bronze schema facet: {e}")
+            bronze_ds = Dataset(namespace="bigquery", name=bronze_fqn)
+        
+        # Output (GCS) can stay simple (no schema facet needed)
+        gcs_ds = Dataset(namespace="gcs", name=ready_name)
+        
+        # START
+        client.emit(RunEvent(
+            eventType=RunState.START,
+            eventTime=datetime.utcnow().isoformat() + "Z",
+            run=Run(runId=run_id),
+            job=Job(namespace=namespace, name=f"{job_name}.{MODE}"),
+            inputs=[bronze_ds],
+            outputs=[gcs_ds],
+            producer="app://gx_validate",
+        ))
+
+        # COMPLETE or FAIL (attach facet directly)
+        summary = GxSummaryFacet(
+            suite=suite_name,
+            run_mode=MODE,
+            success=bool(success),
+            total=int(total),
+            passed=int(passed),
+            failed=int(failed),
+            slice_row_count=int(row_count),
+            bad_row_count=int(bad_count),
+            published=published,
+            partial_publish=partial_publish,
+            # NEW
+            failed_expectations=facet_failed_details,
+            passed_expectations=facet_passed_details,
+            counts_by_expectation_type=counts_map,
+        )
+        final_state = RunState.COMPLETE if success else RunState.FAIL
+
+        client.emit(RunEvent(
+            eventType=final_state,
+            eventTime=datetime.utcnow().isoformat() + "Z",
+            run=Run(runId=run_id, facets={"gx_summary": summary}),
+            job=Job(namespace=namespace, name=f"{job_name}.{MODE}"),
+            inputs=[bronze_ds],
+            outputs=[gcs_ds],
+            producer="app://gx_validate",
+        ))
+
+        print("[OL] Emitted START and FINAL events with gx_summary facet.")
+    except Exception as e:
+        print(f"[OL] Non-fatal: could not prepare/emit facet ({e}).")
+else:
+    print("[OL] OpenLineage client not available; skipping OL emission.")
 
 
 # Exit code (after exports/markers)

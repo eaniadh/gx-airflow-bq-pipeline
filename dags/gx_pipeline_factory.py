@@ -10,9 +10,11 @@ Creates for each dataset (from configs/pipelines.yml):
 The consumer DAG is auto-triggered after GX publish success.
 """
 
-import os, yaml
+import os, yaml, subprocess
 from datetime import timedelta
 import pendulum
+from datetime import datetime as _dt
+import uuid as _uuid
 from airflow import DAG
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.email import EmailOperator
@@ -23,6 +25,16 @@ from airflow.models.param import Param
 from airflow.models import Variable
 from google.cloud import bigquery, storage
 
+# open lineage import --------------------------
+try:
+    from openlineage.client import OpenLineageClient
+    from openlineage.client.run import RunEvent, RunState, Run, Job, Dataset
+    _OL = True
+except Exception:
+    _OL = False
+
+os.environ.setdefault("OPENLINEAGE_URL", "http://marquez:5000")
+os.environ.setdefault("OPENLINEAGE_NAMESPACE", "gx-bq-pipeline")
 # ---------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------
@@ -133,13 +145,20 @@ def gx_validate(config, execution_date, **context):
         env["PYTHONUNBUFFERED"] = "1"        # child prints immediately
         env["TQDM_DISABLE"] = "0"            # show progress bars
         env["GE_LOG_LEVEL"] = "INFO"         # GX logging verbosity
+        # NEW: stitch OpenLineage facet to the Airflow task's run
+        env["AIRFLOW_JOB_NAME"] = f"{context['ti'].dag_id}.{context['ti'].task_id}" if 'ti' in context else "gx_validate"
+        env["AIRFLOW_RUN_ID"]   = context['run_id'] if 'run_id' in context else ""
+        # NEW: ensure OL vars reach child
+        env["OPENLINEAGE_URL"] = os.getenv("OPENLINEAGE_URL", "http://marquez:5000")
+        env["OPENLINEAGE_NAMESPACE"] = os.getenv("OPENLINEAGE_NAMESPACE", "gx-bq-pipeline")
         # NB: DO NOT pass sys.stdout/stderr here; use PIPE and re-print
         proc = subprocess.Popen(
             shlex.split(cmd),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1  # line-buffered
+            bufsize=1,  # line-buffered,
+            env=env,
         )
         # stream to Airflow log line-by-line
         for line in proc.stdout:
@@ -162,7 +181,9 @@ def gx_validate(config, execution_date, **context):
         ready_bucket = config["ready_bucket"]
         success_uri = f"gs://{ready_bucket}/date={date}/_SUCCESS"
         bucket, path = success_uri[5:].split("/", 1)
-        if storage.Client().bucket(bucket).blob(path).exists():
+        #if storage.Client().bucket(bucket).blob(path).exists():
+        #    good_exported = True
+        if _get_client("st").bucket(bucket).blob(path).exists():
             good_exported = True
 
         if rc != 0:
@@ -229,6 +250,39 @@ def check_ready_publish(ready_bucket, date_prefix, max_publish_age_minutes=180, 
     print("✅ Publish markers present and fresh.")
     return True
 
+def _sync_schema_to_marquez(**context):
+    # Figure out which suites exist for this dataset
+    suites = ["basic", "cross"]
+    # if cfg.get("suite_basic"):
+    #     suites.append("basic")
+    # if cfg.get("suite_cross"):
+    #     suites.append("cross")
+
+    if not suites:
+        print("[schema-sync] No suites configured; skipping schema upsert.")
+        return
+
+    project, dataset, table = cfg["bq_table"].split(".")
+
+    for mode in suites:
+        attach_job = f"gx_pipeline__{name}.gx_validate.{mode}"
+        cmd = [
+            "python",
+            "/opt/airflow/dags/helpers/upsert_bq_schema_to_marquez.py",
+            "--project", project,
+            "--dataset", dataset,
+            "--table", table,
+            "--attach-to-job", attach_job,
+            "--marquez-url", os.getenv("OPENLINEAGE_URL", "http://marquez:5000"),
+            "--ol-namespace", os.getenv("OPENLINEAGE_NAMESPACE", "gx-bq-pipeline"),
+            "--dataset-namespace", "bigquery",
+        ]
+        print(f"[schema-sync] Attaching schema to {attach_job} via:", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"[schema-sync] ✅ attached to {attach_job}")
+        except Exception as e:
+            print(f"[schema-sync] ⚠️ attach failed for {attach_job}: {e} (continuing)")
 
 # ---------------------------------------------------------------
 # DAG builders
@@ -290,6 +344,12 @@ def build_gx_pipeline_dag(name, cfg):
             op_args=[cfg],
         )
         
+        sync_schema = PythonOperator(
+            task_id="sync_schema",
+            python_callable=_sync_schema_to_marquez,
+            provide_context=True,
+        )
+
         check_publish = PythonOperator(
             task_id="check_ready_publish",
             python_callable=check_ready_publish,
@@ -299,7 +359,7 @@ def build_gx_pipeline_dag(name, cfg):
                 "timezone": cfg.get("timezone", "UTC"),
             },
         )
-
+   
         shortcircuit = ShortCircuitOperator(
             task_id="short_circuit_if_failed",
             python_callable=short_circuit_if_failed,
@@ -311,18 +371,8 @@ def build_gx_pipeline_dag(name, cfg):
             wait_for_completion=False,
             reset_dag_run=True,
         )
-
-        # email_fail = EmailOperator(
-        #     task_id="email_on_failure",
-        #     to=cfg.get("alert_email"),
-        #     subject="GX Pipeline Failed: {{ dag.dag_id }}",
-        #     html_content="Please check Airflow logs for details.",
-        #     trigger_rule="one_failed",
-        # )
-
-        precheck >> wait_input >> gx_task >> check_publish >> shortcircuit >> trigger_consumer
-        #[gx_task, shortcircuit] >> email_fail
-
+        precheck >> wait_input >> gx_task >> sync_schema >> check_publish >> shortcircuit >> trigger_consumer
+        
     return dag
 
 
@@ -359,7 +409,7 @@ def build_consumer_dag(name, cfg):
     def _gcs_exists_uri(gs_uri: str) -> bool:
         assert gs_uri.startswith("gs://")
         bucket, path = gs_uri[5:].split("/", 1)
-        return storage.Client().bucket(bucket).blob(path).exists()
+        return _get_client("st").bucket(bucket).blob(path).exists()
 
     def _bronze_success_exists(**context) -> bool:
         run_date = context["ds"]
@@ -370,7 +420,47 @@ def build_consumer_dag(name, cfg):
             return False
         print(f"[consumer gate] Found bronze success: {success_uri}")
         return True
+    
+    def _emit_consumer_ol(**context):
+        if not _OL:
+            print("[OL] openlineage client not available; skipping consumer emission.")
+            return
+        ns = os.getenv("OPENLINEAGE_NAMESPACE", "gx-bq-pipeline")
+        url = os.getenv("OPENLINEAGE_URL", "http://marquez:5000")
+        client = OpenLineageClient(url)
 
+        run_date = context["ds"]
+        # Inputs/outputs aligned with gx_validate.py convention
+        gcs_input  = Dataset(namespace="gcs",      name=f"{cfg['ready_bucket']}/date={run_date}/")
+        bq_output  = Dataset(namespace="bigquery", name=f"{project_id}.{dataset_silver}.{silver_table}")
+
+        # Name the consumer job clearly
+        job_name = f"gx_consumer__{name}.consume_and_trigger"
+        run_id = str(_uuid.uuid4())
+        now = _dt.utcnow().isoformat() + "Z"
+        producer = "app://gx_consumer"
+        print(f"[OL] Emitting consumer lineage to {url} in ns={ns}")
+
+        # START
+        client.emit(RunEvent(
+            eventType=RunState.START,
+            eventTime=now,
+            run=Run(runId=run_id),
+            job=Job(namespace=ns, name=job_name),
+            inputs=[gcs_input], outputs=[bq_output],
+            producer=producer,
+        ))
+        # Since this task is a control-plane handoff, immediately COMPLETE
+        client.emit(RunEvent(
+            eventType=RunState.COMPLETE,
+            eventTime=_dt.utcnow().isoformat() + "Z",
+            run=Run(runId=run_id),
+            job=Job(namespace=ns, name=job_name),
+            inputs=[gcs_input], outputs=[bq_output],
+            producer=producer,
+        ))
+        print("[OL] Emitted consumer handoff (GCS → BQ Silver).")
+    
     with dag:
         gate = ShortCircuitOperator(
             task_id="wait_for_bronze_success",
@@ -388,11 +478,15 @@ def build_consumer_dag(name, cfg):
                 "process_date": run_date,
             }
 
-
         prep = PythonOperator(
             task_id="prepare_conf",
             python_callable=_build_conf,
             do_xcom_push=True,
+        )
+        
+        emit_ol = PythonOperator(
+            task_id="emit_consumer_lineage",
+            python_callable=_emit_consumer_ol,
         )
 
         trigger_bq = TriggerDagRunOperator(
@@ -403,7 +497,7 @@ def build_consumer_dag(name, cfg):
             reset_dag_run=True,
         )
 
-        gate >> prep >> trigger_bq
+        gate >> prep >> emit_ol >> trigger_bq
 
     return dag
 
